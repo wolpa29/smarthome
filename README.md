@@ -8,6 +8,8 @@ This repository is the heart of my smart home setup. It contains my device confi
 
 ## Featured Projects
 
-### [Homeassistant Local LLM Voice & Text Control AddOn](https://github.com/wolpay29/hass-ai-gateway)
+### [Homeassistant Local LLM Voice & Text Control AddOn](https://github.com/wolpa29/hass-ai-gateway)
+
+### [LOcal Wakeword Trainer for VoiceAssistant](https://github.com/wolpa29/local-wakeword-trainer)
 
 
