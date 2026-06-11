@@ -44,7 +44,7 @@ This repository is the heart of my smart home setup — it contains ESP32/ESP826
     </td>
     <td>
       <b><a href="https://github.com/wolpa29/homeassistant-pv-forecast-planner">Home Assistant PV Forecast Planner</a></b><br>
-      Plans energy-intensive tasks (dishwasher, washing machine, etc.) around solar production forecasts.
+      ML pipeline for PV forecasting and planning -> data scraping, dataset building, ML Model training (XGBoost), forecasting, planning.
     </td>
   </tr>
   <tr>
