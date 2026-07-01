@@ -26,7 +26,7 @@ This repository is the heart of my smart home setup — it contains ESP32/ESP826
     </td>
     <td>
       <b><a href="https://github.com/wolpay29/hass-ai-gateway">Home Assistant Local LLM Voice & Text Control Add-On</a></b><br>
-      A Home Assistant add-on that routes voice and text commands to a locally running LLM — no cloud required.
+      A Home Assistant add-on that routes voice and text commands to a locally running LLM — no cloud required. 
     </td>
   </tr>
   <tr>

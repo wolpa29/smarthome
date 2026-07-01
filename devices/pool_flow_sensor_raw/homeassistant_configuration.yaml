@@ -1,0 +1,273 @@
+# =============================================================================
+# Pool Flow Sensor - HA config V2: swimming detection
+#
+# Output: binary_sensor.pool_swimming (latched)
+#   - turns ON ~1 min after someone starts swimming
+#   - stays ON the whole swim
+#   - held while the pump ramps up/down or runs manually
+#   - turns OFF after 5 min calm
+#   No false triggers from wind/rain or the pump ramps.
+#
+# Water flows over the overflow -> pipes -> tank (sensor). That smooths out
+# small wind/rain ripples but keeps the big slow surges a swimmer makes.
+#
+# Flow: raw 1Hz -> spread -> baseline -> excess -> ACTIVITY (moving now?)
+#       ACTIVITY (+ pump phases) -> POOL_SWIMMING (latched session)
+#
+# A baseline beats a fixed threshold: steady wind/rain lifts the baseline too,
+# so it doesn't look like swimming.
+#
+# Load EITHER V1 OR V2, not both.
+# THRESH_DIFF is a placeholder - tune from History (pump-only/wind/rain/swim).
+#
+# Inputs you provide:
+#   input_boolean.pool_in_startphase   - pump ramping up
+#   input_boolean.pool_in_stopphase    - pump off, ramping down
+#   input_boolean.pool_block_detection - manual run, ignore detection
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Base sensor + status (status is just for the dashboard)
+# -----------------------------------------------------------------------------
+mqtt:
+  sensor:
+    - name: "Pool Flow Raw"
+      unique_id: pool_flow_raw
+      state_topic: "pool/flow/raw"
+      unit_of_measurement: "p/s"
+      value_template: "{{ value }}"
+      force_update: true
+      availability_topic: "pool/flow/status"
+      payload_available: "online"
+      payload_not_available: "offline"
+
+  binary_sensor:
+    - name: "Pool Flow Sensor Status"
+      unique_id: pool_flow_sensor_status
+      state_topic: "pool/flow/status"
+      payload_on: "online"
+      payload_off: "offline"
+      device_class: connectivity
+      qos: 1
+
+
+# -----------------------------------------------------------------------------
+# 1) Spread: stddev of the raw flow over 15 s.
+# -----------------------------------------------------------------------------
+sensor:
+  - platform: statistics
+    name: "Pool Flow Spread 15s"
+    entity_id: sensor.pool_flow_raw
+    state_characteristic: standard_deviation
+    sampling_size: 30
+    max_age:
+      seconds: 15
+    precision: 2
+
+  # 30 s mean. Pump scripts use it to tell "pump running" (~170) from
+  # swimming/calm (well below). Threshold ~130.
+  - platform: statistics
+    name: "Pool Flow Mean 30s"
+    entity_id: sensor.pool_flow_raw
+    state_characteristic: mean
+    sampling_size: 60
+    max_age:
+      seconds: 30
+    precision: 1
+
+  # Smooth first, then spread. The 15 s mean kills the fast pump noise but keeps
+  # the slow swim surges; its stddev (spread_smooth) stays low with the pump on
+  # and rises when someone swims.
+  - platform: statistics
+    name: "Pool Flow Mean 15s"
+    entity_id: sensor.pool_flow_raw
+    state_characteristic: mean
+    sampling_size: 20
+    max_age:
+      seconds: 15
+    precision: 1
+  - platform: statistics
+    name: "Pool Flow Spread Smooth"
+    entity_id: sensor.pool_flow_mean_15s
+    state_characteristic: standard_deviation
+    sampling_size: 40
+    max_age:
+      seconds: 25
+    precision: 2
+
+
+template:
+  # ---------------------------------------------------------------------------
+  # 2) Baseline of the spread (slow EMA, ~8 min).
+  #    Priority: pump phase > swimming freeze > EMA.
+  #    Frozen while swimming so a long swim isn't learned as normal. A pump
+  #    start/stop wins over the freeze and re-seeds to the new level.
+  # ---------------------------------------------------------------------------
+  - trigger:
+      - platform: time_pattern
+        seconds: "/5"
+      # Re-seed on the phase edges - the 5 s ticks can miss a short startphase.
+      - platform: state
+        entity_id:
+          - input_boolean.pool_in_startphase
+          - input_boolean.pool_in_stopphase
+    sensor:
+      - name: "Pool Flow Spread Baseline"
+        unique_id: pool_flow_spread_baseline
+        unit_of_measurement: "p/s"
+        state: >
+          {# alpha 0.01 at 5 s tick -> ~500 s (~8 min) time constant #}
+          {% set alpha = 0.01 %}
+          {# clamp so a ramp spike/glitch can't pin the baseline. Set BASE_MAX
+             just above the highest calm/steady-pump spread in History. #}
+          {% set BASE_MIN = 0.0 %}
+          {% set BASE_MAX = 6.0 %}
+          {% set spread = states('sensor.pool_flow_spread_smooth') | float(0) %}
+          {% set base = this.state | float(spread) %}
+          {% set in_phase = is_state('input_boolean.pool_in_startphase', 'on')
+                         or is_state('input_boolean.pool_in_stopphase', 'on') %}
+          {% if in_phase %}
+            {# pump changed: re-seed to the new level, even mid-swim #}
+            {% set new = spread %}
+          {% elif is_state('binary_sensor.pool_swimming', 'on') %}
+            {# swimming: freeze, don't learn the swim in #}
+            {% set new = base %}
+          {% else %}
+            {% set new = alpha * spread + (1 - alpha) * base %}
+          {% endif %}
+          {{ [[new, BASE_MAX] | min, BASE_MIN] | max | round(3) }}
+
+  # ---------------------------------------------------------------------------
+  # 3) Excess = spread minus baseline. What ACTIVITY decides on.
+  #    Negative = calmer than normal (never swimming).
+  # ---------------------------------------------------------------------------
+  - sensor:
+      - name: "Pool Flow Excess"
+        unique_id: pool_flow_excess
+        unit_of_measurement: "p/s"
+        state: >
+          {% set spread = states('sensor.pool_flow_spread_smooth') | float(0) %}
+          {% set base = states('sensor.pool_flow_spread_baseline') | float(0) %}
+          {{ (spread - base) | round(2) }}
+
+  # ---------------------------------------------------------------------------
+  # 3b) Calm seconds so far (0 while active). Shows how close we are to the
+  #     5 min release. While blocked, activity is forced off - not real calm,
+  #     so report 0. After a block, count from the block-end, not the stale
+  #     blanked moment. Same logic as section 5.
+  # ---------------------------------------------------------------------------
+  - trigger:
+      - platform: time_pattern
+        seconds: "/5"
+      - platform: state
+        entity_id:
+          - binary_sensor.pool_flow_activity
+          - binary_sensor.pool_swimming
+          - input_boolean.pool_in_startphase
+          - input_boolean.pool_in_stopphase
+          - input_boolean.pool_block_detection
+    sensor:
+      - name: "Pool Calm Duration"
+        unique_id: pool_calm_duration
+        unit_of_measurement: "s"
+        device_class: duration
+        state: >
+          {% set blocked = is_state('input_boolean.pool_in_startphase', 'on')
+                        or is_state('input_boolean.pool_in_stopphase', 'on')
+                        or is_state('input_boolean.pool_block_detection', 'on') %}
+          {% if not is_state('binary_sensor.pool_swimming', 'on') %}
+            0
+          {% elif blocked or is_state('binary_sensor.pool_flow_activity', 'on') %}
+            0
+          {% else %}
+            {# count from the latest of: activity off, or any block clearing #}
+            {% set edges = [
+                 states.binary_sensor.pool_flow_activity.last_changed,
+                 states.input_boolean.pool_in_startphase.last_changed,
+                 states.input_boolean.pool_in_stopphase.last_changed,
+                 states.input_boolean.pool_block_detection.last_changed ] %}
+            {{ (now() - (edges | max)).total_seconds() | round(0) }}
+          {% endif %}
+
+  # ---------------------------------------------------------------------------
+  # 4) ACTIVITY = is the flow moving now?
+  #    On when excess > THRESH_DIFF. Pump ramps and manual runs are blanked so
+  #    they can't look like swimming. delay_off 10 s reports calm fast; the
+  #    5 min release lives in section 5.
+  # ---------------------------------------------------------------------------
+  - binary_sensor:
+      - name: "Pool Flow Activity"
+        unique_id: pool_flow_activity
+        device_class: moving
+        state: >
+          {% set diff = states('sensor.pool_flow_excess') | float(0) %}
+          {% set THRESH_DIFF = 3.0 %}
+          {# swimmer adds ~10-15 above baseline, wind/rain only ~2; set
+             THRESH_DIFF between them. negative excess never swims. #}
+          {{ diff > THRESH_DIFF
+             and not is_state('sensor.pool_flow_raw', 'unavailable')
+             and not is_state('input_boolean.pool_in_startphase', 'on')
+             and not is_state('input_boolean.pool_in_stopphase', 'on')
+             and not is_state('input_boolean.pool_block_detection', 'on') }}
+        delay_on: "00:00:00"
+        delay_off: "00:00:10"
+
+  # ---------------------------------------------------------------------------
+  # 5) POOL_SWIMMING = latched session state (the output).
+  #    Re-checked on every change + every 30 s:
+  #      blocked (start/stop/manual) -> hold
+  #      off -> on when activity is on
+  #      on  -> off after 5 min calm
+  # ---------------------------------------------------------------------------
+  - trigger:
+      - platform: state
+        entity_id:
+          - binary_sensor.pool_flow_activity
+          - input_boolean.pool_in_startphase
+          - input_boolean.pool_in_stopphase
+          - input_boolean.pool_block_detection
+      - platform: time_pattern
+        seconds: "/30"
+    binary_sensor:
+      - name: "Pool Swimming"
+        unique_id: pool_swimming
+        device_class: moving
+        state: >
+          {% set RELEASE = 300 %}
+          {% set prev = this.state == 'on' %}
+          {% set blocked = is_state('input_boolean.pool_in_startphase', 'on')
+                        or is_state('input_boolean.pool_in_stopphase', 'on')
+                        or is_state('input_boolean.pool_block_detection', 'on') %}
+          {% set active = is_state('binary_sensor.pool_flow_activity', 'on') %}
+          {# activity is blanked off during a block, so its last_changed alone
+             fakes elapsed calm and would release right after the block. Count
+             from the latest of activity-off and any block-end, so the 5 min
+             timer only starts once detection is live again. #}
+          {% set edges = [
+               states.binary_sensor.pool_flow_activity.last_changed,
+               states.input_boolean.pool_in_startphase.last_changed,
+               states.input_boolean.pool_in_stopphase.last_changed,
+               states.input_boolean.pool_block_detection.last_changed ] %}
+          {% set calm_for = (now() - (edges | max)).total_seconds() %}
+          {% if blocked %}
+            {{ 'on' if prev else 'off' }}
+          {% elif not prev %}
+            {{ 'on' if active else 'off' }}
+          {% elif not active and calm_for >= RELEASE %}
+            off
+          {% else %}
+            on
+          {% endif %}
+
+
+# -----------------------------------------------------------------------------
+# How my automations plug in (for reference)
+# -----------------------------------------------------------------------------
+# A) pool_swimming ON  -> pump ON. Raise pool_in_startphase while it ramps
+#    (detection blanked, held ON). Clear it when the ramp is done.
+# B) pool_swimming OFF (after 5 min calm) -> pump OFF. Raise pool_in_stopphase
+#    during ramp-down (blanked/held).
+# C) Manual run -> raise pool_block_detection (detection frozen).
+#
+# RELEASE (5 min) is in section 5; THRESH_DIFF is in section 4.
